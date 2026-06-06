@@ -1,3 +1,5 @@
+runpod
 onnxruntime-gpu
 pillow
 numpy
+requests

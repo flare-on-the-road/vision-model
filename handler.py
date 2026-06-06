@@ -1,13 +1,18 @@
-from cog import BasePredictor, Input, Path
+import base64
+import io
+import os
+import traceback
+from typing import Any, Dict, List, Optional
 
-from typing import Any, Dict, List
-from PIL import Image
 import numpy as np
 import onnxruntime as ort
+import requests
+from PIL import Image
+
+import runpod
 
 
-MODEL_PATH = "models/best.onnx"
-
+MODEL_PATH = os.getenv("MODEL_PATH", "models/model.onnx")
 INPUT_IMAGE_SIZE = 640
 
 CLASS_NAMES = {
@@ -20,34 +25,40 @@ RISK_CLASSES = {"fire", "smoke"}
 FALSE_POSITIVE_CLASSES = {"carlight"}
 
 
-class Predictor(BasePredictor):
-    def setup(self) -> None:
-        """
-        Replicate 컨테이너가 시작될 때 한 번만 실행된다.
-        여기서 ONNX 모델을 메모리에 로드한다.
-        """
+class RTDETRv2OnnxDetector:
+    def __init__(self) -> None:
+        self.device = "unknown"
+        self.session = None
+        self.input_names: List[str] = []
+        self.output_names: List[str] = []
 
+        self._load_model()
+
+    def _load_model(self) -> None:
         available_providers = ort.get_available_providers()
+        require_cuda = os.getenv("REQUIRE_CUDA", "1") == "1"
 
-        if "CUDAExecutionProvider" not in available_providers:
-            raise RuntimeError(
-                "CUDAExecutionProvider is not available. "
-                f"Available providers: {available_providers}. "
-                "This model is configured for GPU inference. "
-                "Check cog.yaml build.gpu or onnxruntime-gpu installation."
-            )
+        if "CUDAExecutionProvider" in available_providers:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self.device = "cuda"
+        else:
+            if require_cuda:
+                raise RuntimeError(
+                    "CUDAExecutionProvider is not available. "
+                    f"Available providers: {available_providers}. "
+                    "RunPod GPU worker should normally provide CUDAExecutionProvider. "
+                    "For local CPU testing, set REQUIRE_CUDA=0."
+                )
 
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.device = "cuda"
+            providers = ["CPUExecutionProvider"]
+            self.device = "cpu"
 
         print(f"[INFO] Loading ONNX model from: {MODEL_PATH}")
         print(f"[INFO] Available ONNX Runtime providers: {available_providers}")
         print(f"[INFO] Selected ONNX Runtime providers: {providers}")
 
         session_options = ort.SessionOptions()
-        session_options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         self.session = ort.InferenceSession(
             MODEL_PATH,
@@ -65,43 +76,40 @@ class Predictor(BasePredictor):
 
         print("[INFO] ONNX model loaded successfully")
 
+    def _validate_model_io(self) -> None:
+        required_inputs = {"images", "orig_target_sizes"}
+        required_outputs = {"labels", "boxes", "scores"}
+
+        input_name_set = set(self.input_names)
+        output_name_set = set(self.output_names)
+
+        missing_inputs = required_inputs - input_name_set
+        missing_outputs = required_outputs - output_name_set
+
+        if missing_inputs:
+            raise ValueError(
+                f"Missing required ONNX inputs: {missing_inputs}. "
+                f"Actual inputs: {self.input_names}"
+            )
+
+        if missing_outputs:
+            raise ValueError(
+                f"Missing required ONNX outputs: {missing_outputs}. "
+                f"Actual outputs: {self.output_names}"
+            )
+
     def predict(
         self,
-        image: Path = Input(description="Input CCTV frame image"),
-        confidence: float = Input(
-            description="Confidence threshold",
-            default=0.25,
-            ge=0.0,
-            le=1.0,
-        ),
-        max_detections: int = Input(
-            description="Maximum number of detections to return",
-            default=100,
-            ge=1,
-            le=300,
-        ),
+        image: Image.Image,
+        confidence: float = 0.25,
+        max_detections: int = 100,
     ) -> Dict[str, Any]:
-        """
-        이미지 1장을 입력받아 ONNX RT-DETR 추론 결과를 JSON으로 반환한다.
-
-        ONNX input:
-        - images: [1, 3, 640, 640] float32
-        - orig_target_sizes: [1, 2] int64, [width, height]
-
-        ONNX output:
-        - labels: [1, 300] int64
-        - boxes: [1, 300, 4] float32, x1 y1 x2 y2, 원본 이미지 기준
-        - scores: [1, 300] float32
-        """
-
-        image_path = str(image)
-
-        pil_image = Image.open(image_path).convert("RGB")
+        pil_image = image.convert("RGB")
         original_width, original_height = pil_image.size
 
         input_image = self._preprocess_image(pil_image)
 
-        # ONNX 스펙상 원본 이미지 크기 순서는 [width, height]
+        # ONNX 스펙상 원본 크기 순서는 [width, height]
         orig_target_sizes = np.array(
             [[original_width, original_height]],
             dtype=np.int64,
@@ -177,41 +185,7 @@ class Predictor(BasePredictor):
             "false_positive_hints": false_positive_hints,
         }
 
-    def _validate_model_io(self) -> None:
-        """
-        모델 입출력 이름이 예상과 다른 경우 초기에 바로 확인하기 위한 검증.
-        """
-
-        required_inputs = {"images", "orig_target_sizes"}
-        required_outputs = {"labels", "boxes", "scores"}
-
-        input_name_set = set(self.input_names)
-        output_name_set = set(self.output_names)
-
-        missing_inputs = required_inputs - input_name_set
-        missing_outputs = required_outputs - output_name_set
-
-        if missing_inputs:
-            raise ValueError(
-                f"Missing required ONNX inputs: {missing_inputs}. "
-                f"Actual inputs: {self.input_names}"
-            )
-
-        if missing_outputs:
-            raise ValueError(
-                f"Missing required ONNX outputs: {missing_outputs}. "
-                f"Actual outputs: {self.output_names}"
-            )
-
     def _preprocess_image(self, image: Image.Image) -> np.ndarray:
-        """
-        ONNX input spec:
-        images: [1, 3, 640, 640] float32
-
-        학습/검증 설정에서 Resize 640x640 후 float32 scale=True 형태였으므로
-        RGB → resize → /255.0 → CHW → NCHW 순서로 변환한다.
-        """
-
         resized = image.resize(
             (INPUT_IMAGE_SIZE, INPUT_IMAGE_SIZE),
             Image.Resampling.BILINEAR,
@@ -225,7 +199,6 @@ class Predictor(BasePredictor):
         # CHW -> NCHW
         image_array = np.expand_dims(image_array, axis=0)
 
-        # ONNXRuntime에 안정적으로 넘기기 위해 contiguous 보장
         image_array = np.ascontiguousarray(image_array)
 
         return image_array.astype(np.float32)
@@ -235,10 +208,6 @@ class Predictor(BasePredictor):
         images: np.ndarray,
         orig_target_sizes: np.ndarray,
     ) -> Dict[str, np.ndarray]:
-        """
-        ONNX 모델 input 이름에 맞춰 입력 dict를 만든다.
-        """
-
         input_feed: Dict[str, np.ndarray] = {}
 
         for name in self.input_names:
@@ -258,15 +227,6 @@ class Predictor(BasePredictor):
         self,
         outputs: List[np.ndarray],
     ) -> Dict[str, np.ndarray]:
-        """
-        ONNX output을 이름 기준으로 labels, boxes, scores에 매핑한다.
-
-        Output spec:
-        - labels: [1, 300]
-        - boxes: [1, 300, 4]
-        - scores: [1, 300]
-        """
-
         output_map = {
             name: value
             for name, value in zip(self.output_names, outputs)
@@ -288,13 +248,6 @@ class Predictor(BasePredictor):
         original_width: int,
         original_height: int,
     ) -> List[Dict[str, Any]]:
-        """
-        labels, boxes, scores를 JSON-friendly detection list로 변환한다.
-
-        boxes는 이미 원본 이미지 기준 x1, y1, x2, y2 픽셀 좌표로 나온다는
-        스펙이므로 별도의 scale 변환을 하지 않는다.
-        """
-
         labels = labels[0]
         boxes = boxes[0]
         scores = scores[0]
@@ -312,13 +265,11 @@ class Predictor(BasePredictor):
 
             x1, y1, x2, y2 = [float(v) for v in box.tolist()]
 
-            # 모델 출력이 이미지 범위를 조금 벗어나는 경우 방어적으로 clip
             x1 = self._clip(x1, 0, original_width)
             y1 = self._clip(y1, 0, original_height)
             x2 = self._clip(x2, 0, original_width)
             y2 = self._clip(y2, 0, original_height)
 
-            # 유효하지 않은 box는 제외
             if x2 <= x1 or y2 <= y1:
                 continue
 
@@ -370,12 +321,6 @@ class Predictor(BasePredictor):
         self,
         risk_detections: List[Dict[str, Any]],
     ) -> int:
-        """
-        MVP용 위험도 계산.
-        fire/smoke 탐지 confidence와 개수를 기반으로 단순 계산한다.
-        이후에는 연속 프레임 감지 여부, CCTV 위치, VLM 결과 등을 반영하면 된다.
-        """
-
         if not risk_detections:
             return 0
 
@@ -399,3 +344,107 @@ class Predictor(BasePredictor):
         max_value: float,
     ) -> float:
         return max(min_value, min(value, max_value))
+
+
+def load_image_from_base64(image_base64: str) -> Image.Image:
+    if image_base64.startswith("data:image"):
+        image_base64 = image_base64.split(",", 1)[1]
+
+    image_bytes = base64.b64decode(image_base64)
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+def load_image_from_url(image_url: str) -> Image.Image:
+    response = requests.get(
+        image_url,
+        timeout=30,
+        headers={
+            "User-Agent": "rtdetrv2-runpod-worker/1.0"
+        },
+    )
+    response.raise_for_status()
+
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
+
+
+def load_image_from_input(job_input: Dict[str, Any]) -> Image.Image:
+    image_url = job_input.get("image_url")
+    image_base64 = job_input.get("image_base64")
+
+    if image_url:
+        return load_image_from_url(image_url)
+
+    if image_base64:
+        return load_image_from_base64(image_base64)
+
+    raise ValueError(
+        "Missing image input. Provide either 'image_url' or 'image_base64'."
+    )
+
+
+# 모델은 worker 시작 시 한 번만 로드한다.
+# RunPod 문서/템플릿에서도 무거운 모델은 handler 내부가 아니라
+# 스크립트 시작 시점에 로드하는 방식을 권장한다.
+DETECTOR = RTDETRv2OnnxDetector()
+
+
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RunPod Serverless entrypoint.
+
+    Expected input:
+
+    {
+      "input": {
+        "image_url": "https://example.com/frame.jpg",
+        "confidence": 0.25,
+        "max_detections": 100
+      }
+    }
+
+    또는
+
+    {
+      "input": {
+        "image_base64": "...",
+        "confidence": 0.25,
+        "max_detections": 100
+      }
+    }
+    """
+
+    try:
+        job_input = event.get("input", {})
+
+        confidence = float(job_input.get("confidence", 0.25))
+        max_detections = int(job_input.get("max_detections", 100))
+
+        if confidence < 0.0 or confidence > 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+
+        if max_detections < 1 or max_detections > 300:
+            raise ValueError("max_detections must be between 1 and 300")
+
+        image = load_image_from_input(job_input)
+
+        result = DETECTOR.predict(
+            image=image,
+            confidence=confidence,
+            max_detections=max_detections,
+        )
+
+        return result
+
+    except Exception as exc:
+        error_trace = traceback.format_exc()
+        print("[ERROR] Inference failed")
+        print(error_trace)
+
+        return {
+            "success": False,
+            "error": str(exc),
+            "traceback": error_trace,
+        }
+
+
+runpod.serverless.start({"handler": handler})
