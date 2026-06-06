@@ -370,5 +370,3 @@ pyrightconfig.json
 
 *.pt
 *.onnx
-
-.cog/**

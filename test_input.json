@@ -1,7 +1,0 @@
-{
-    "input": {
-        "image_url": "https://example.com/test.jpg",
-        "confidence": 0.25,
-        "max_detections": 100
-    }
-}
