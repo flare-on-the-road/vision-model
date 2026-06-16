@@ -1,11 +1,22 @@
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+import base64
+import logging
+import os
+import re
 
 import numpy as np
 import onnxruntime as ort
+import requests as http_requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from PIL import Image
 import io
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger(__name__)
 
 
 MODEL_PATH = "models/best.onnx"
@@ -123,6 +134,27 @@ class OnnxPredictor:
 
 predictor = OnnxPredictor()
 
+# ── VLM 설정 ─────────────────────────────────────────────────────────────────
+
+_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+_OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "")
+_OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
+_OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+_VLM_PROMPT = (
+    "이 이미지는 Vision AI가 객체를 탐지한 결과입니다. 이미지에는 바운딩 박스(BBox)와 레이블이 표시되어 있습니다.\n\n"
+    "각 BBox의 레이블이 실제 이미지 내용과 일치하는지 검증해주세요.\n\n"
+    "오탐으로 판정하는 기준:\n"
+    "- BBox 레이블이 실제 객체와 다른 경우 (예: 불꽃인데 carlight로 표기, 구름인데 smoke로 표기)\n"
+    "- 실제로 해당 객체가 없는데 감지된 경우\n"
+    "- 조명·반사·햇빛 등 유사 시각 패턴을 화염으로 잘못 분류한 경우\n"
+    "- 이 시스템은 터널 환경에서 운영되며 터널 내 구름은 발생하지 않음. "
+    "매연·소화 분말·증기·먼지 등을 화재 연기로 잘못 분류한 경우\n\n"
+    "다음 두 가지만 한국어로 간결하게 답변해주세요:\n"
+    "1. 오탐 여부: yes(오탐) 또는 no(정상 탐지)\n"
+    "2. 오탐이 맞을 경우 오탐 원인 분석 / 오탐이 아닐 경우 \"pass\""
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -136,6 +168,65 @@ app = FastAPI(title="FLARE Vision API", lifespan=lifespan)
 @app.get("/health")
 def health():
     return {"status": "ok", "device": predictor.device}
+
+
+def _call_vlm(image_bytes: bytes) -> Optional[dict]:
+    """OpenRouter VLM 호출 내부 함수. 실패 시 None 반환 (파이프라인 중단 방지)."""
+    if not _OPENROUTER_API_KEY or not _OPENROUTER_MODEL:
+        logger.warning("[VLM] OPENROUTER_API_KEY 또는 OPENROUTER_MODEL 미설정 → 생략")
+        return None
+    logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL})")
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    payload = {
+        "model": _OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": _VLM_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]}],
+        "max_tokens": 256,
+        "temperature": 0,
+    }
+    try:
+        resp = http_requests.post(
+            _OPENROUTER_ENDPOINT,
+            json=payload,
+            headers={"Authorization": f"Bearer {_OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            timeout=_OPENROUTER_TIMEOUT,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        logger.info(f"[VLM] 응답 원문: {raw[:200]}")
+    except Exception as e:
+        logger.error(f"[VLM] 호출 실패: {e}")
+        return None
+    result = _parse_vlm_response(raw)
+    logger.info(f"[VLM] 파싱 결과: {result}")
+    return result
+
+
+@app.post("/vlm")
+async def vlm(image: UploadFile = File(...)):
+    """이미지를 OpenRouter VLM으로 분석해 오탐 여부를 반환한다."""
+    if not _OPENROUTER_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENROUTER_API_KEY 미설정")
+    if not _OPENROUTER_MODEL:
+        raise HTTPException(status_code=503, detail="OPENROUTER_MODEL 미설정")
+
+    image_bytes = await image.read()
+    result = _call_vlm(image_bytes)
+    if result is None:
+        raise HTTPException(status_code=502, detail="VLM 호출 또는 파싱 실패")
+    return result
+
+
+def _parse_vlm_response(raw: str):
+    match = re.search(r"1\.\s*오탐\s*여부\s*[:：]\s*(yes|no)", raw, re.IGNORECASE)
+    if not match:
+        return None
+    is_false_positive = match.group(1).lower() == "yes"
+    reason_match = re.search(r"2\.\s*(.+)", raw)
+    reason = reason_match.group(1).strip() if reason_match else ""
+    return {"is_fire": not is_false_positive, "reason": reason}
 
 
 @app.post("/predict")
@@ -157,6 +248,12 @@ async def predict(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    # fire/smoke 탐지 시 VLM 2차 판단을 내부에서 즉시 수행
+    if result["summary"]["risk_candidate"]:
+        result["vlm"] = _call_vlm(image_bytes)
+    else:
+        result["vlm"] = None
 
     return result
 
