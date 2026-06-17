@@ -28,6 +28,7 @@ def _int_env(name: str, default: int) -> int:
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/best.onnx")
 REQUIRE_CUDA = os.getenv("VISION_REQUIRE_CUDA", "true").lower() == "true"
+PRELOAD_CUDA_DLLS = os.getenv("VISION_PRELOAD_CUDA_DLLS", "true").lower() == "true"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _int_env("PORT", 8000)
 INPUT_IMAGE_SIZE = 640
@@ -50,11 +51,14 @@ class OnnxPredictor:
         self.output_names = []
 
     def load(self):
+        if PRELOAD_CUDA_DLLS and hasattr(ort, "preload_dlls"):
+            # Allows onnxruntime-gpu[cuda,cudnn] NVIDIA wheels to be discovered.
+            ort.preload_dlls(directory="")
+
         available_providers = ort.get_available_providers()
 
         if "CUDAExecutionProvider" in available_providers:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            self.device = "cuda"
         elif REQUIRE_CUDA:
             raise RuntimeError(
                 "CUDAExecutionProvider is not available. "
@@ -78,11 +82,28 @@ class OnnxPredictor:
             providers=providers,
         )
 
+        active_providers = self.session.get_providers()
+        if REQUIRE_CUDA and "CUDAExecutionProvider" not in active_providers:
+            raise RuntimeError(
+                "CUDAExecutionProvider was requested but is not active after "
+                "creating the ONNX Runtime session. "
+                f"Requested providers: {providers}. "
+                f"Active providers: {active_providers}. "
+                "Check CUDA/cuDNN runtime libraries. For recent onnxruntime-gpu, "
+                "install CUDA 12 and cuDNN 9 dependencies or run "
+                "`pip install 'onnxruntime-gpu[cuda,cudnn]'`."
+            )
+
+        self.device = (
+            "cuda" if "CUDAExecutionProvider" in active_providers else "cpu"
+        )
+
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
 
         print(f"[INFO] Input names: {self.input_names}")
         print(f"[INFO] Output names: {self.output_names}")
+        print(f"[INFO] Active ONNX Runtime providers: {active_providers}")
         self._validate_model_io()
         print(f"[INFO] Model loaded on {self.device}")
 
