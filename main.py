@@ -19,7 +19,8 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", date
 logger = logging.getLogger(__name__)
 
 
-MODEL_PATH = "models/best.onnx"
+MODEL_PATH = os.getenv("MODEL_PATH", "models/best.onnx")
+REQUIRE_CUDA = os.getenv("VISION_REQUIRE_CUDA", "true").lower() == "true"
 INPUT_IMAGE_SIZE = 640
 
 CLASS_NAMES = {
@@ -45,6 +46,13 @@ class OnnxPredictor:
         if "CUDAExecutionProvider" in available_providers:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             self.device = "cuda"
+        elif REQUIRE_CUDA:
+            raise RuntimeError(
+                "CUDAExecutionProvider is not available. "
+                f"Available providers: {available_providers}. "
+                "Install a CUDA-compatible onnxruntime-gpu environment or set "
+                "VISION_REQUIRE_CUDA=false for local CPU testing."
+            )
         else:
             providers = ["CPUExecutionProvider"]
             self.device = "cpu"
@@ -66,7 +74,27 @@ class OnnxPredictor:
 
         print(f"[INFO] Input names: {self.input_names}")
         print(f"[INFO] Output names: {self.output_names}")
+        self._validate_model_io()
         print(f"[INFO] Model loaded on {self.device}")
+
+    def _validate_model_io(self):
+        required_inputs = {"images", "orig_target_sizes"}
+        required_outputs = {"labels", "boxes", "scores"}
+
+        missing_inputs = required_inputs - set(self.input_names)
+        missing_outputs = required_outputs - set(self.output_names)
+
+        if missing_inputs:
+            raise ValueError(
+                f"Missing required ONNX inputs: {missing_inputs}. "
+                f"Actual inputs: {self.input_names}"
+            )
+
+        if missing_outputs:
+            raise ValueError(
+                f"Missing required ONNX outputs: {missing_outputs}. "
+                f"Actual outputs: {self.output_names}"
+            )
 
     def predict(
         self,
@@ -167,7 +195,12 @@ app = FastAPI(title="FLARE Vision API", lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": predictor.device}
+    return {
+        "status": "ok",
+        "device": predictor.device,
+        "model_path": MODEL_PATH,
+        "providers": ort.get_available_providers(),
+    }
 
 
 def _call_vlm(image_bytes: bytes) -> Optional[dict]:
