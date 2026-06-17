@@ -113,6 +113,12 @@ pip install -r requirements.txt
 MODEL_PATH=models/best.onnx VISION_REQUIRE_CUDA=true uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+`main.py`를 직접 실행해도 같은 서버가 뜹니다.
+
+```bash
+MODEL_PATH=models/best.onnx VISION_REQUIRE_CUDA=true python main.py
+```
+
 GPU 환경이 정상이라면 `/health`에서 `device: "cuda"`가 반환됩니다.
 
 ```bash
@@ -122,6 +128,7 @@ curl http://localhost:8000/health
 로컬 CPU 테스트가 필요할 때만 다음처럼 실행합니다.
 
 ```bash
+pip install -r requirements-cpu.txt
 VISION_REQUIRE_CUDA=false uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 

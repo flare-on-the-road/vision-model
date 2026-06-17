@@ -19,8 +19,17 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", date
 logger = logging.getLogger(__name__)
 
 
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    return int(value)
+
+
 MODEL_PATH = os.getenv("MODEL_PATH", "models/best.onnx")
 REQUIRE_CUDA = os.getenv("VISION_REQUIRE_CUDA", "true").lower() == "true"
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = _int_env("PORT", 8000)
 INPUT_IMAGE_SIZE = 640
 
 CLASS_NAMES = {
@@ -166,7 +175,7 @@ predictor = OnnxPredictor()
 
 _OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 _OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "")
-_OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
+_OPENROUTER_TIMEOUT = _int_env("OPENROUTER_TIMEOUT", 30)
 _OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 _VLM_PROMPT = (
@@ -381,3 +390,9 @@ def _calculate_risk_score(risk_detections: List[Dict[str, Any]]) -> int:
 
 def _clip(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
