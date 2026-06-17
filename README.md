@@ -113,6 +113,7 @@ python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cublas/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cudnn/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cufft/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/curand/lib:${LD_LIBRARY_PATH:-}"
 MODEL_PATH=models/best.onnx VISION_REQUIRE_CUDA=true uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -138,6 +139,19 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -c "import onnxruntime as ort; print(ort.__version__); print(ort.get_available_providers())"
+```
+
+`libcublasLt.so.11` 오류가 나면 CUDA 11 런타임 라이브러리 경로가 systemd 프로세스에 전달되지 않은 상태입니다. systemd 서비스 파일에 가상환경의 NVIDIA 라이브러리 경로를 추가합니다.
+
+```ini
+Environment="LD_LIBRARY_PATH=/home/flare/vision-model/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:/home/flare/vision-model/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/home/flare/vision-model/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/home/flare/vision-model/.venv/lib/python3.12/site-packages/nvidia/cufft/lib:/home/flare/vision-model/.venv/lib/python3.12/site-packages/nvidia/curand/lib"
+```
+
+반영 후:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart flare-vision-model.service
 ```
 
 정상이어도 `CUDAExecutionProvider`가 실제 세션 provider로 활성화되지 않으면 서버 startup이 실패하도록 되어 있습니다. CPU로만 확인하려면 아래처럼 명시적으로 fallback을 허용합니다.

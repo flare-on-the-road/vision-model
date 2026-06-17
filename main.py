@@ -92,9 +92,9 @@ class OnnxPredictor:
                 "creating the ONNX Runtime session. "
                 f"Requested providers: {providers}. "
                 f"Active providers: {active_providers}. "
-                "Check CUDA/cuDNN runtime libraries. For recent onnxruntime-gpu, "
-                "install CUDA 12 and cuDNN 9 dependencies or run "
-                "`pip install 'onnxruntime-gpu[cuda,cudnn]'`."
+                "Check CUDA/cuDNN runtime libraries and LD_LIBRARY_PATH. "
+                "For GTX 1060 with onnxruntime-gpu==1.18.0, CUDA 11.8/cuDNN 8 "
+                "runtime libraries such as libcublasLt.so.11 must be available."
             )
 
         self.device = (
