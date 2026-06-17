@@ -53,7 +53,10 @@ class OnnxPredictor:
     def load(self):
         if PRELOAD_CUDA_DLLS and hasattr(ort, "preload_dlls"):
             # Allows onnxruntime-gpu[cuda,cudnn] NVIDIA wheels to be discovered.
-            ort.preload_dlls(directory="")
+            try:
+                ort.preload_dlls(directory="")
+            except Exception as exc:
+                logger.warning(f"[ORT] CUDA DLL preload skipped: {exc}")
 
         available_providers = ort.get_available_providers()
 
