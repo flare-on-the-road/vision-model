@@ -10,13 +10,23 @@ import onnxruntime as ort
 import requests as http_requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from PIL import Image
+from PIL import Image, ImageDraw
 import io
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
+
+
+def _ensure_logging():
+    """uvicorn default log_config가 root logger를 WARNING으로 덮어쓰므로 lifespan에서 복구."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+        root.addHandler(handler)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -29,6 +39,7 @@ def _int_env(name: str, default: int) -> int:
 MODEL_PATH = os.getenv("MODEL_PATH", "models/best.onnx")
 REQUIRE_CUDA = os.getenv("VISION_REQUIRE_CUDA", "true").lower() == "true"
 PRELOAD_CUDA_DLLS = os.getenv("VISION_PRELOAD_CUDA_DLLS", "true").lower() == "true"
+VISION_DEBUG = os.getenv("VISION_DEBUG", "false").lower() == "true"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _int_env("PORT", 8000)
 INPUT_IMAGE_SIZE = 640
@@ -219,6 +230,7 @@ _VLM_PROMPT = (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _ensure_logging()
     predictor.load()
     yield
 
@@ -236,12 +248,47 @@ def health():
     }
 
 
+_BBOX_COLORS = {
+    "fire": (255, 60, 60),
+    "smoke": (180, 180, 180),
+    "carlight": (255, 210, 0),
+}
+
+
+def _draw_bboxes(image_bytes: bytes, detections: list) -> bytes:
+    """탐지 결과(bbox + 레이블)를 이미지에 그려 JPEG bytes로 반환."""
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(pil_image)
+
+    for det in detections:
+        bbox = det["bbox"]
+        class_name = det["class_name"]
+        confidence = det["confidence"]
+        color = _BBOX_COLORS.get(class_name, (255, 255, 255))
+
+        x1, y1, x2, y2 = bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+
+        label = f"{class_name} {confidence:.2f}"
+        draw.text((x1, max(0, y1 - 16)), label, fill=color)
+
+    buf = io.BytesIO()
+    pil_image.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
 def _call_vlm(image_bytes: bytes) -> Optional[dict]:
     """OpenRouter VLM 호출 내부 함수. 실패 시 None 반환 (파이프라인 중단 방지)."""
     if not _OPENROUTER_API_KEY or not _OPENROUTER_MODEL:
         logger.warning("[VLM] OPENROUTER_API_KEY 또는 OPENROUTER_MODEL 미설정 → 생략")
         return None
-    logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL})")
+
+    if VISION_DEBUG:
+        logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL}, image={len(image_bytes)}B)")
+        logger.info(f"[VLM] 프롬프트:\n{_VLM_PROMPT}")
+    else:
+        logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL})")
+
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "model": _OPENROUTER_MODEL,
@@ -261,12 +308,23 @@ def _call_vlm(image_bytes: bytes) -> Optional[dict]:
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
-        logger.info(f"[VLM] 응답 원문: {raw[:200]}")
+        if VISION_DEBUG:
+            logger.info(f"[VLM] 응답 원문 전체:\n{raw}")
+        else:
+            logger.info(f"[VLM] 응답 원문: {raw[:200]}")
     except Exception as e:
         logger.error(f"[VLM] 호출 실패: {e}")
+        if VISION_DEBUG:
+            logger.exception("[VLM] 스택 트레이스:")
         return None
+
     result = _parse_vlm_response(raw)
-    logger.info(f"[VLM] 파싱 결과: {result}")
+    if VISION_DEBUG:
+        logger.info(f"[VLM] 파싱 결과: {result}")
+        if result is None:
+            logger.warning(f"[VLM] 파싱 실패 — 응답에서 '1. 오탐 여부: yes/no' 패턴을 찾지 못했습니다.")
+    else:
+        logger.info(f"[VLM] 파싱 결과: {result}")
     return result
 
 
@@ -315,10 +373,13 @@ async def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # fire/smoke 탐지 시 VLM 2차 판단을 내부에서 즉시 수행
+    # fire/smoke 탐지 시 bbox 이미지 생성 → VLM 2차 판단
     if result["summary"]["risk_candidate"]:
-        result["vlm"] = _call_vlm(image_bytes)
+        annotated_bytes = _draw_bboxes(image_bytes, result["risk_detections"])
+        result["annotated_image_b64"] = base64.b64encode(annotated_bytes).decode("utf-8")
+        result["vlm"] = _call_vlm(annotated_bytes)
     else:
+        result["annotated_image_b64"] = None
         result["vlm"] = None
 
     return result
