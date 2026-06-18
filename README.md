@@ -1,4 +1,4 @@
-# RT-DETRv2 ONNX Fire & Smoke Detector
+# RT-DETRv2 ONNX Fire & Smoke Detector 
 
 커스텀 학습된 RT-DETRv2 기반 객체 탐지 모델을 ONNXRuntime GPU로 실행하고, FastAPI로 직접 서빙하기 위한 프로젝트입니다.
 
