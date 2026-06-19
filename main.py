@@ -37,7 +37,11 @@ def _int_env(name: str, default: int) -> int:
 
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/best.onnx")
-REQUIRE_CUDA = os.getenv("VISION_REQUIRE_CUDA", "true").lower() == "true"
+VISION_DEVICE_POLICY = os.getenv("VISION_DEVICE_POLICY", "").strip().lower()
+if not VISION_DEVICE_POLICY:
+    VISION_DEVICE_POLICY = "auto"
+REQUIRE_CUDA = VISION_DEVICE_POLICY in {"cuda", "require-cuda", "gpu", "require-gpu"}
+FORCE_CPU = VISION_DEVICE_POLICY in {"cpu", "force-cpu"}
 PRELOAD_CUDA_DLLS = os.getenv("VISION_PRELOAD_CUDA_DLLS", "true").lower() == "true"
 VISION_DEBUG = os.getenv("VISION_DEBUG", "false").lower() == "true"
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -94,18 +98,24 @@ class OnnxPredictor:
 
         available_providers = ort.get_available_providers()
 
-        if "CUDAExecutionProvider" in available_providers:
+        if not FORCE_CPU and "CUDAExecutionProvider" in available_providers:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         elif REQUIRE_CUDA:
             raise RuntimeError(
                 "CUDAExecutionProvider is not available. "
                 f"Available providers: {available_providers}. "
                 "Install a CUDA-compatible onnxruntime-gpu environment or set "
-                "VISION_REQUIRE_CUDA=false for local CPU testing."
+                "VISION_DEVICE_POLICY=auto/cpu to allow CPU fallback."
             )
         else:
             providers = ["CPUExecutionProvider"]
             self.device = "cpu"
+            logger.warning(
+                "[ORT] CUDAExecutionProvider is not available for %s. "
+                "Falling back to CPU. Available providers: %s",
+                self.display_name,
+                available_providers,
+            )
 
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"{self.display_name} model file not found: {self.model_path}")

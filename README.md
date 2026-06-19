@@ -123,14 +123,14 @@ python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cublas/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cudnn/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cufft/lib:$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/curand/lib:${LD_LIBRARY_PATH:-}"
-MODEL_PATH=models/best.onnx VISION_REQUIRE_CUDA=true uvicorn main:app --host 0.0.0.0 --port 8000
+export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cublas/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cudnn/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/cufft/lib:$VIRTUAL_ENV/lib/python3.10/site-packages/nvidia/curand/lib:${LD_LIBRARY_PATH:-}"
+MODEL_PATH=models/best.onnx VISION_DEVICE_POLICY=auto uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 `main.py`를 직접 실행해도 같은 서버가 뜹니다.
 
 ```bash
-MODEL_PATH=models/best.onnx VISION_REQUIRE_CUDA=true python main.py
+MODEL_PATH=models/best.onnx VISION_DEVICE_POLICY=auto python main.py
 ```
 
 GPU 환경이 정상이라면 `/health`에서 `device: "cuda"`가 반환됩니다.
@@ -164,13 +164,21 @@ sudo systemctl daemon-reload
 sudo systemctl restart flare-vision-model.service
 ```
 
-정상이어도 `CUDAExecutionProvider`가 실제 세션 provider로 활성화되지 않으면 서버 startup이 실패하도록 되어 있습니다. CPU로만 확인하려면 아래처럼 명시적으로 fallback을 허용합니다.
+기본 실행 정책은 `VISION_DEVICE_POLICY=auto`입니다. CUDA provider가 보이면 GPU를 사용하고, 보이지 않으면 CPU로 fallback하여 서버는 계속 부팅됩니다.
+
+GPU가 반드시 필요한 운영 환경에서 CUDA provider가 없을 때 startup을 실패시키려면 아래처럼 명시합니다.
+
+```bash
+VISION_DEVICE_POLICY=require-cuda uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+CPU로만 확인하려면 아래처럼 명시적으로 CPU를 강제합니다.
 
 로컬 CPU 테스트가 필요할 때만 다음처럼 실행합니다.
 
 ```bash
 pip install -r requirements-cpu.txt
-VISION_REQUIRE_CUDA=false uvicorn main:app --host 0.0.0.0 --port 8000
+VISION_DEVICE_POLICY=cpu uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ### 백엔드 연결
@@ -598,17 +606,21 @@ Dashboard 표시
 
 ### 17.1 GPU 실행 확인
 
-현재 `main.py`는 기본적으로 `CUDAExecutionProvider`가 없으면 에러를 발생시키도록 구성되어 있습니다.
+현재 `main.py`는 기본적으로 `VISION_DEVICE_POLICY=auto`로 동작합니다. `CUDAExecutionProvider`가 있으면 GPU를 사용하고, 없으면 CPU로 fallback합니다.
 
-GPU 환경에서 정상 실행된다면 `/health` 응답의 `device` 필드는 다음과 같이 표시됩니다.
+GPU 환경에서 정상 실행된다면 `/health` 응답의 모델별 `device` 필드는 다음과 같이 표시됩니다.
 
 ```json
 {
-  "device": "cuda"
+  "models": {
+    "rt-detr": {
+      "device": "cuda"
+    }
+  }
 }
 ```
 
-만약 로컬 CPU 환경에서도 테스트하고 싶다면 `VISION_REQUIRE_CUDA=false`로 실행합니다.
+만약 로컬 CPU 환경에서도 테스트하고 싶다면 `VISION_DEVICE_POLICY=cpu`로 실행합니다. 반대로 GPU provider가 없을 때 startup을 실패시키고 싶다면 `VISION_DEVICE_POLICY=require-cuda`를 사용합니다.
 
 ---
 
