@@ -93,13 +93,23 @@ rtdetr-onnx/
 models/best.onnx
 ```
 
-`main.py`는 기본적으로 `models/best.onnx`를 읽습니다. 다른 위치에 둘 경우 `MODEL_PATH` 환경변수로 지정합니다.
+`main.py`는 기본적으로 RT-DETR, YOLOv8, YOLOv11 ONNX 모델을 함께 로드합니다. 경로 기본값은 다음과 같습니다.
 
-```bash
-MODEL_PATH=/home/ubuntu/models/best.onnx
+```text
+models/best.onnx
+models/YOLOv8l_fp32.onnx
+models/YOLOv11lbest_fp32.onnx
 ```
 
-모델 파일을 다른 위치에 둘 경우 `MODEL_PATH`를 수정해야 합니다.
+다른 위치에 둘 경우 환경변수로 지정합니다.
+
+```bash
+RT_DETR_MODEL_PATH=/home/ubuntu/models/best.onnx
+YOLOV8_MODEL_PATH=/home/ubuntu/models/YOLOv8l_fp32.onnx
+YOLOV11_MODEL_PATH=/home/ubuntu/models/YOLOv11lbest_fp32.onnx
+```
+
+기존 호환을 위해 `RT_DETR_MODEL_PATH`가 없으면 `MODEL_PATH`를 RT-DETR 경로로 사용합니다.
 
 ## 6. FastAPI 실행
 
@@ -172,7 +182,7 @@ VISION_API_URL=http://<GPU_VM_PUBLIC_OR_PRIVATE_IP>:8000
 VISION_API_TIMEOUT_SECONDS=30
 ```
 
-이후 백엔드의 `/api/ai-lab/detect`가 `rt-detr` 요청을 Vision API `/predict`로 프록시합니다. YOLO 비교 모델은 별도 서버가 연결되기 전까지 unavailable 결과를 반환합니다.
+이후 백엔드의 `/api/ai-lab/detect`가 `rt-detr`, `yolov8`, `yolov11` 요청을 Vision API `/predict`로 프록시합니다. Vision API는 multipart form-data의 `model_key` 값으로 사용할 ONNX 모델을 선택합니다.
 
 ---
 

@@ -43,6 +43,7 @@ VISION_DEBUG = os.getenv("VISION_DEBUG", "false").lower() == "true"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _int_env("PORT", 8000)
 INPUT_IMAGE_SIZE = 640
+NMS_IOU_THRESHOLD = float(os.getenv("VISION_YOLO_NMS_IOU_THRESHOLD", "0.45"))
 
 CLASS_NAMES = {
     0: "fire",
@@ -53,9 +54,31 @@ CLASS_NAMES = {
 RISK_CLASSES = {"fire", "smoke"}
 FALSE_POSITIVE_CLASSES = {"carlight"}
 
+MODEL_CONFIGS = {
+    "rt-detr": {
+        "display_name": "RT-DETRv2",
+        "path": os.getenv("RT_DETR_MODEL_PATH", MODEL_PATH),
+        "type": "rtdetr",
+    },
+    "yolov8": {
+        "display_name": "YOLOv8",
+        "path": os.getenv("YOLOV8_MODEL_PATH", "models/YOLOv8l_fp32.onnx"),
+        "type": "yolo",
+    },
+    "yolov11": {
+        "display_name": "YOLOv11",
+        "path": os.getenv("YOLOV11_MODEL_PATH", "models/YOLOv11lbest_fp32.onnx"),
+        "type": "yolo",
+    },
+}
+
 
 class OnnxPredictor:
-    def __init__(self):
+    def __init__(self, model_key: str, display_name: str, model_path: str, model_type: str):
+        self.model_key = model_key
+        self.display_name = display_name
+        self.model_path = model_path
+        self.model_type = model_type
         self.session = None
         self.device = None
         self.input_names = []
@@ -84,14 +107,17 @@ class OnnxPredictor:
             providers = ["CPUExecutionProvider"]
             self.device = "cpu"
 
-        print(f"[INFO] Loading ONNX model: {MODEL_PATH}")
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(f"{self.display_name} model file not found: {self.model_path}")
+
+        print(f"[INFO] Loading ONNX model ({self.model_key}): {self.model_path}")
         print(f"[INFO] Providers: {providers}")
 
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         self.session = ort.InferenceSession(
-            MODEL_PATH,
+            self.model_path,
             sess_options=session_options,
             providers=providers,
         )
@@ -119,9 +145,17 @@ class OnnxPredictor:
         print(f"[INFO] Output names: {self.output_names}")
         print(f"[INFO] Active ONNX Runtime providers: {active_providers}")
         self._validate_model_io()
-        print(f"[INFO] Model loaded on {self.device}")
+        print(f"[INFO] {self.display_name} loaded on {self.device}")
 
     def _validate_model_io(self):
+        if self.model_type == "yolo":
+            if not self.input_names or not self.output_names:
+                raise ValueError(
+                    f"{self.display_name} has invalid ONNX IO. "
+                    f"Inputs: {self.input_names}, outputs: {self.output_names}"
+                )
+            return
+
         required_inputs = {"images", "orig_target_sizes"}
         required_outputs = {"labels", "boxes", "scores"}
 
@@ -149,26 +183,33 @@ class OnnxPredictor:
         pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         original_width, original_height = pil_image.size
 
-        input_image = _preprocess_image(pil_image)
-        orig_target_sizes = np.array([[original_width, original_height]], dtype=np.int64)
+        if self.model_type == "yolo":
+            detections = self._predict_yolo(
+                pil_image=pil_image,
+                confidence=confidence,
+                max_detections=max_detections,
+            )
+        else:
+            input_image = _preprocess_image(pil_image)
+            orig_target_sizes = np.array([[original_width, original_height]], dtype=np.int64)
 
-        input_feed = {
-            name: (input_image if name == "images" else orig_target_sizes)
-            for name in self.input_names
-        }
+            input_feed = {
+                name: (input_image if name == "images" else orig_target_sizes)
+                for name in self.input_names
+            }
 
-        outputs = self.session.run(self.output_names, input_feed)
-        output_map = dict(zip(self.output_names, outputs))
+            outputs = self.session.run(self.output_names, input_feed)
+            output_map = dict(zip(self.output_names, outputs))
 
-        detections = _postprocess(
-            labels=output_map["labels"],
-            boxes=output_map["boxes"],
-            scores=output_map["scores"],
-            confidence=confidence,
-            max_detections=max_detections,
-            original_width=original_width,
-            original_height=original_height,
-        )
+            detections = _postprocess_rtdetr(
+                labels=output_map["labels"],
+                boxes=output_map["boxes"],
+                scores=output_map["scores"],
+                confidence=confidence,
+                max_detections=max_detections,
+                original_width=original_width,
+                original_height=original_height,
+            )
 
         risk_detections = [d for d in detections if d["class_name"] in RISK_CLASSES]
         false_positive_hints = [d for d in detections if d["class_name"] in FALSE_POSITIVE_CLASSES]
@@ -179,7 +220,9 @@ class OnnxPredictor:
 
         return {
             "success": True,
-            "model": "rtdetrv2-onnx",
+            "model": self.model_key,
+            "model_name": self.display_name,
+            "model_path": self.model_path,
             "device": self.device,
             "image": {
                 "width": original_width,
@@ -203,8 +246,56 @@ class OnnxPredictor:
             "false_positive_hints": false_positive_hints,
         }
 
+    def _predict_yolo(
+        self,
+        pil_image: Image.Image,
+        confidence: float,
+        max_detections: int,
+    ) -> List[Dict[str, Any]]:
+        original_width, original_height = pil_image.size
+        input_image = _preprocess_image(pil_image)
+        outputs = self.session.run(self.output_names, {self.input_names[0]: input_image})
+        return _postprocess_yolo(
+            output=outputs[0],
+            confidence=confidence,
+            max_detections=max_detections,
+            original_width=original_width,
+            original_height=original_height,
+        )
 
-predictor = OnnxPredictor()
+class PredictorRegistry:
+    def __init__(self):
+        self.predictors: Dict[str, OnnxPredictor] = {}
+
+    def load(self):
+        for model_key, config in MODEL_CONFIGS.items():
+            predictor = OnnxPredictor(
+                model_key=model_key,
+                display_name=config["display_name"],
+                model_path=config["path"],
+                model_type=config["type"],
+            )
+            predictor.load()
+            self.predictors[model_key] = predictor
+
+    def get(self, model_key: str) -> OnnxPredictor:
+        if model_key not in self.predictors:
+            raise KeyError(model_key)
+        return self.predictors[model_key]
+
+    def health(self):
+        return {
+            key: {
+                "display_name": predictor.display_name,
+                "device": predictor.device,
+                "model_path": predictor.model_path,
+                "type": predictor.model_type,
+            }
+            for key, predictor in self.predictors.items()
+        }
+
+
+predictors = PredictorRegistry()
 
 # ── VLM 설정 ─────────────────────────────────────────────────────────────────
 
@@ -231,7 +322,7 @@ _VLM_PROMPT = (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _ensure_logging()
-    predictor.load()
+    predictors.load()
     yield
 
 
@@ -242,8 +333,7 @@ app = FastAPI(title="FLARE Vision API", lifespan=lifespan)
 def health():
     return {
         "status": "ok",
-        "device": predictor.device,
-        "model_path": MODEL_PATH,
+        "models": predictors.health(),
         "providers": ort.get_available_providers(),
     }
 
@@ -356,6 +446,7 @@ def _parse_vlm_response(raw: str):
 @app.post("/predict")
 async def predict(
     image: UploadFile = File(...),
+    model_key: str = Form(default="rt-detr"),
     confidence: float = Form(default=0.25, ge=0.0, le=1.0),
     max_detections: int = Form(default=100, ge=1, le=300),
 ):
@@ -365,10 +456,16 @@ async def predict(
     image_bytes = await image.read()
 
     try:
+        predictor = predictors.get(model_key)
         result = predictor.predict(
             image_bytes=image_bytes,
             confidence=confidence,
             max_detections=max_detections,
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"지원하지 않는 model_key입니다: {model_key}",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -395,7 +492,7 @@ def _preprocess_image(image: Image.Image) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def _postprocess(
+def _postprocess_rtdetr(
     labels: np.ndarray,
     boxes: np.ndarray,
     scores: np.ndarray,
@@ -455,6 +552,148 @@ def _postprocess(
 
     detections.sort(key=lambda d: d["confidence"], reverse=True)
     return detections[:max_detections]
+
+
+def _postprocess_yolo(
+    output: np.ndarray,
+    confidence: float,
+    max_detections: int,
+    original_width: int,
+    original_height: int,
+) -> List[Dict[str, Any]]:
+    predictions = np.asarray(output)
+    if predictions.ndim == 3:
+        predictions = predictions[0]
+
+    if predictions.ndim != 2:
+        raise ValueError(f"Unexpected YOLO output shape: {predictions.shape}")
+
+    # Ultralytics ONNX usually returns [classes+4, anchors]. Convert to [anchors, attrs].
+    if predictions.shape[0] <= len(CLASS_NAMES) + 5 and predictions.shape[1] > predictions.shape[0]:
+        predictions = predictions.T
+
+    candidates: List[Dict[str, Any]] = []
+    class_count = len(CLASS_NAMES)
+
+    for prediction in predictions:
+        if prediction.shape[0] < 4 + class_count:
+            continue
+
+        box = prediction[:4].astype(np.float32)
+        class_scores = prediction[4:4 + class_count].astype(np.float32)
+
+        # Some exports include objectness before class scores: [x, y, w, h, obj, cls...].
+        if prediction.shape[0] >= 5 + class_count:
+            objectness = float(prediction[4])
+            objectness_class_scores = prediction[5:5 + class_count].astype(np.float32)
+            if objectness <= 1.0 and objectness_class_scores.size == class_count:
+                combined_scores = objectness * objectness_class_scores
+                if float(np.max(combined_scores)) > float(np.max(class_scores)):
+                    class_scores = combined_scores
+
+        class_id = int(np.argmax(class_scores))
+        score_float = float(class_scores[class_id])
+        if score_float < confidence:
+            continue
+
+        cx, cy, width, height = [float(v) for v in box.tolist()]
+
+        if max(abs(cx), abs(cy), abs(width), abs(height)) <= 1.5:
+            x1 = (cx - width / 2) * original_width
+            y1 = (cy - height / 2) * original_height
+            x2 = (cx + width / 2) * original_width
+            y2 = (cy + height / 2) * original_height
+        else:
+            scale_x = original_width / INPUT_IMAGE_SIZE
+            scale_y = original_height / INPUT_IMAGE_SIZE
+            x1 = (cx - width / 2) * scale_x
+            y1 = (cy - height / 2) * scale_y
+            x2 = (cx + width / 2) * scale_x
+            y2 = (cy + height / 2) * scale_y
+
+        x1 = _clip(x1, 0, original_width)
+        y1 = _clip(y1, 0, original_height)
+        x2 = _clip(x2, 0, original_width)
+        y2 = _clip(y2, 0, original_height)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        candidates.append(
+            {
+                "class_id": class_id,
+                "class_name": CLASS_NAMES.get(class_id, f"class_{class_id}"),
+                "confidence": score_float,
+                "xyxy": [x1, y1, x2, y2],
+            }
+        )
+
+    kept = _nms(candidates, NMS_IOU_THRESHOLD)[:max_detections]
+    detections: List[Dict[str, Any]] = []
+
+    for candidate in kept:
+        x1, y1, x2, y2 = candidate["xyxy"]
+        box_width = x2 - x1
+        box_height = y2 - y1
+        class_name = candidate["class_name"]
+
+        detections.append({
+            "class_id": candidate["class_id"],
+            "class_name": class_name,
+            "confidence": round(candidate["confidence"], 6),
+            "bbox": {
+                "x1": round(x1, 2),
+                "y1": round(y1, 2),
+                "x2": round(x2, 2),
+                "y2": round(y2, 2),
+                "width": round(box_width, 2),
+                "height": round(box_height, 2),
+                "area": round(box_width * box_height, 2),
+            },
+            "bbox_normalized": {
+                "x1": round(x1 / original_width, 6) if original_width else 0.0,
+                "y1": round(y1 / original_height, 6) if original_height else 0.0,
+                "x2": round(x2 / original_width, 6) if original_width else 0.0,
+                "y2": round(y2 / original_height, 6) if original_height else 0.0,
+            },
+            "is_risk_class": class_name in RISK_CLASSES,
+            "is_false_positive_hint": class_name in FALSE_POSITIVE_CLASSES,
+        })
+
+    return detections
+
+
+def _nms(candidates: List[Dict[str, Any]], iou_threshold: float) -> List[Dict[str, Any]]:
+    candidates = sorted(candidates, key=lambda item: item["confidence"], reverse=True)
+    kept: List[Dict[str, Any]] = []
+
+    while candidates:
+        current = candidates.pop(0)
+        kept.append(current)
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["class_id"] != current["class_id"]
+            or _iou(current["xyxy"], candidate["xyxy"]) < iou_threshold
+        ]
+
+    return kept
+
+
+def _iou(a: List[float], b: List[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_width = max(0.0, inter_x2 - inter_x1)
+    inter_height = max(0.0, inter_y2 - inter_y1)
+    intersection = inter_width * inter_height
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
 
 
 def _calculate_risk_score(risk_detections: List[Dict[str, Any]]) -> int:
