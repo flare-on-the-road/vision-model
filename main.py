@@ -58,6 +58,9 @@ CLASS_NAMES = {
 RISK_CLASSES = {"fire", "smoke"}
 FALSE_POSITIVE_CLASSES = {"carlight"}
 
+VLM_CONF_LOW = 0.6
+VLM_CONF_HIGH = 0.8
+
 MODEL_CONFIGS = {
     "rt-detr": {
         "display_name": "RT-DETRv2",
@@ -226,8 +229,6 @@ class OnnxPredictor:
 
         max_confidence = max((d["confidence"] for d in detections), default=0.0)
         risk_max_confidence = max((d["confidence"] for d in risk_detections), default=0.0)
-        risk_score = _calculate_risk_score(risk_detections)
-
         return {
             "success": True,
             "model": self.model_key,
@@ -244,12 +245,10 @@ class OnnxPredictor:
             },
             "summary": {
                 "total_detections": len(detections),
-                "risk_candidate": len(risk_detections) > 0,
                 "risk_detection_count": len(risk_detections),
                 "false_positive_hint_count": len(false_positive_hints),
                 "max_confidence": max_confidence,
                 "risk_max_confidence": risk_max_confidence,
-                "risk_score": risk_score,
             },
             "detections": detections,
             "risk_detections": risk_detections,
@@ -480,9 +479,13 @@ async def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # fire/smoke 탐지 시 bbox 이미지 생성 → VLM 2차 판단
-    if result["summary"]["risk_candidate"]:
-        annotated_bytes = _draw_bboxes(image_bytes, result["risk_detections"])
+    # 신뢰도 구간(0.6~0.8) 탐지 시 bbox 이미지 생성 → VLM 2차 판단
+    vlm_candidates = [
+        d for d in result["detections"]
+        if VLM_CONF_LOW <= d["confidence"] <= VLM_CONF_HIGH
+    ]
+    if vlm_candidates:
+        annotated_bytes = _draw_bboxes(image_bytes, vlm_candidates)
         result["annotated_image_b64"] = base64.b64encode(annotated_bytes).decode("utf-8")
         result["vlm"] = _call_vlm(annotated_bytes)
     else:
@@ -704,22 +707,6 @@ def _iou(a: List[float], b: List[float]) -> float:
     area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     union = area_a + area_b - intersection
     return intersection / union if union > 0 else 0.0
-
-
-def _calculate_risk_score(risk_detections: List[Dict[str, Any]]) -> int:
-    if not risk_detections:
-        return 0
-
-    max_conf = max(d["confidence"] for d in risk_detections)
-    count = len(risk_detections)
-    score = int(max_conf * 100)
-
-    if count >= 2:
-        score += 10
-    if count >= 3:
-        score += 10
-
-    return min(score, 100)
 
 
 def _clip(value: float, min_value: float, max_value: float) -> float:
