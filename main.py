@@ -313,19 +313,30 @@ _OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "")
 _OPENROUTER_TIMEOUT = _int_env("OPENROUTER_TIMEOUT", 30)
 _OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
-_VLM_PROMPT = (
-    "이 이미지는 Vision AI가 객체를 탐지한 결과입니다. 이미지에는 바운딩 박스(BBox)와 레이블이 표시되어 있습니다.\n\n"
-    "각 BBox의 레이블이 실제 이미지 내용과 일치하는지 검증해주세요.\n\n"
-    "오탐으로 판정하는 기준:\n"
-    "- BBox 레이블이 실제 객체와 다른 경우 (예: 불꽃인데 carlight로 표기, 구름인데 smoke로 표기)\n"
-    "- 실제로 해당 객체가 없는데 감지된 경우\n"
-    "- 조명·반사·햇빛 등 유사 시각 패턴을 화염으로 잘못 분류한 경우\n"
-    "- 이 시스템은 터널 환경에서 운영되며 터널 내 구름은 발생하지 않음. "
-    "매연·소화 분말·증기·먼지 등을 화재 연기로 잘못 분류한 경우\n\n"
-    "다음 두 가지만 한국어로 간결하게 답변해주세요:\n"
-    "1. 오탐 여부: yes(오탐) 또는 no(정상 탐지)\n"
-    "2. 오탐이 맞을 경우 오탐 원인 분석 / 오탐이 아닐 경우 \"pass\""
-)
+def _build_vlm_prompt(detections: list) -> str:
+    lines = [
+        "이 이미지는 터널 CCTV 화재 감지 AI의 탐지 결과입니다.",
+        "이미지에는 바운딩 박스(BBox)와 레이블이 표시되어 있습니다.",
+        "",
+        "탐지된 항목:",
+    ]
+    for i, det in enumerate(detections, 1):
+        lines.append(f"{i}. {det['class_name']} (신뢰도 {det['confidence']:.2f})")
+    lines += [
+        "",
+        "각 항목이 오탐(잘못된 탐지)인지 판단하세요.",
+        "",
+        "오탐 판단 기준:",
+        "- 실제 해당 객체가 없는데 감지된 경우",
+        "- 조명·반사·햇빛 등 유사 시각 패턴을 화염(fire)으로 잘못 분류한 경우",
+        "- 차량 전조등(carlight)을 화염으로 잘못 분류한 경우",
+        "- 터널 환경 특성상 구름 없음 (매연·분말·증기·먼지를 smoke로 잘못 분류 포함)",
+        "",
+        "반드시 아래 형식으로만 답변하세요 (번호 순서대로):",
+    ]
+    for i in range(1, len(detections) + 1):
+        lines.append(f"{i}. 오탐 여부: yes(오탐) 또는 no(정상) / 판단 근거")
+    return "\n".join(lines)
 
 
 @asynccontextmanager
@@ -376,26 +387,32 @@ def _draw_bboxes(image_bytes: bytes, detections: list) -> bytes:
     return buf.getvalue()
 
 
-def _call_vlm(image_bytes: bytes) -> Optional[dict]:
-    """OpenRouter VLM 호출 내부 함수. 실패 시 None 반환 (파이프라인 중단 방지)."""
+def _call_vlm(image_bytes: bytes, detections: list) -> Optional[list]:
+    """
+    OpenRouter VLM 호출. 탐지 항목별 오탐 여부를 반환한다.
+    성공 시 [{"class_name": str, "is_false_positive": bool, "reason": str}, ...] 반환.
+    실패 시 None.
+    """
     if not _OPENROUTER_API_KEY or not _OPENROUTER_MODEL:
         logger.warning("[VLM] OPENROUTER_API_KEY 또는 OPENROUTER_MODEL 미설정 → 생략")
         return None
 
+    prompt = _build_vlm_prompt(detections)
+
     if VISION_DEBUG:
         logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL}, image={len(image_bytes)}B)")
-        logger.info(f"[VLM] 프롬프트:\n{_VLM_PROMPT}")
+        logger.info(f"[VLM] 프롬프트:\n{prompt}")
     else:
-        logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL})")
+        logger.info(f"[VLM] 호출 시작 (model={_OPENROUTER_MODEL}, items={len(detections)})")
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
         "model": _OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": [
-            {"type": "text", "text": _VLM_PROMPT},
+            {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ]}],
-        "max_tokens": 256,
+        "max_tokens": 128 * len(detections),
         "temperature": 0,
     }
     try:
@@ -410,46 +427,65 @@ def _call_vlm(image_bytes: bytes) -> Optional[dict]:
         if VISION_DEBUG:
             logger.info(f"[VLM] 응답 원문 전체:\n{raw}")
         else:
-            logger.info(f"[VLM] 응답 원문: {raw[:200]}")
+            logger.info(f"[VLM] 응답 원문: {raw[:300]}")
     except Exception as e:
         logger.error(f"[VLM] 호출 실패: {e}")
         if VISION_DEBUG:
             logger.exception("[VLM] 스택 트레이스:")
         return None
 
-    result = _parse_vlm_response(raw)
-    if VISION_DEBUG:
-        logger.info(f"[VLM] 파싱 결과: {result}")
-        if result is None:
-            logger.warning(f"[VLM] 파싱 실패 — 응답에서 '1. 오탐 여부: yes/no' 패턴을 찾지 못했습니다.")
+    result = _parse_vlm_response(raw, detections)
+    if result is None:
+        logger.warning("[VLM] 파싱 실패 — 응답에서 번호별 yes/no 패턴을 찾지 못했습니다.")
     else:
         logger.info(f"[VLM] 파싱 결과: {result}")
     return result
 
 
+def _parse_vlm_response(raw: str, detections: list) -> Optional[list]:
+    results = []
+    for i, det in enumerate(detections, 1):
+        # "1. 오탐 여부: yes / 근거" 또는 "1. yes / 근거" 형태 모두 허용
+        pattern = rf"{i}\.\s*(?:오탐\s*여부\s*[:：]\s*)?(yes|no)\s*[/／、,]\s*(.+?)(?=\n\s*\d+\.|$)"
+        match = re.search(pattern, raw, re.IGNORECASE | re.DOTALL)
+        if not match:
+            logger.warning(f"[VLM] {i}번 항목({det['class_name']}) 파싱 실패")
+            return None
+        is_false_positive = match.group(1).lower() == "yes"
+        reason = match.group(2).strip()
+        results.append({
+            "class_name": det["class_name"],
+            "is_false_positive": is_false_positive,
+            "reason": reason,
+        })
+    return results if results else None
+
+
 @app.post("/vlm")
-async def vlm(image: UploadFile = File(...)):
-    """이미지를 OpenRouter VLM으로 분석해 오탐 여부를 반환한다."""
+async def vlm(
+    image: UploadFile = File(...),
+    detections: str = Form(default="[]"),
+):
+    """이미지와 탐지 목록을 받아 항목별 오탐 여부를 반환한다."""
     if not _OPENROUTER_API_KEY:
         raise HTTPException(status_code=503, detail="OPENROUTER_API_KEY 미설정")
     if not _OPENROUTER_MODEL:
         raise HTTPException(status_code=503, detail="OPENROUTER_MODEL 미설정")
 
+    import json as _json
+    try:
+        det_list = _json.loads(detections)
+    except Exception:
+        raise HTTPException(status_code=400, detail="detections 필드가 유효한 JSON이 아닙니다.")
+
+    if not isinstance(det_list, list) or not det_list:
+        raise HTTPException(status_code=400, detail="detections는 비어있지 않은 배열이어야 합니다.")
+
     image_bytes = await image.read()
-    result = _call_vlm(image_bytes)
+    result = _call_vlm(image_bytes, det_list)
     if result is None:
         raise HTTPException(status_code=502, detail="VLM 호출 또는 파싱 실패")
     return result
-
-
-def _parse_vlm_response(raw: str):
-    match = re.search(r"1\.\s*오탐\s*여부\s*[:：]\s*(yes|no)", raw, re.IGNORECASE)
-    if not match:
-        return None
-    is_false_positive = match.group(1).lower() == "yes"
-    reason_match = re.search(r"2\.\s*(.+)", raw)
-    reason = reason_match.group(1).strip() if reason_match else ""
-    return {"is_fire": not is_false_positive, "reason": reason}
 
 
 @app.post("/predict")
@@ -479,7 +515,7 @@ async def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 신뢰도 구간(0.6~0.8) 탐지 시 bbox 이미지 생성 → VLM 2차 판단
+    # 신뢰도 구간(0.6~0.8) 탐지 시 bbox 이미지 생성 → VLM 2차 판단 (항목별 오탐 여부)
     vlm_candidates = [
         d for d in result["detections"]
         if VLM_CONF_LOW <= d["confidence"] <= VLM_CONF_HIGH
@@ -487,7 +523,7 @@ async def predict(
     if vlm_candidates:
         annotated_bytes = _draw_bboxes(image_bytes, vlm_candidates)
         result["annotated_image_b64"] = base64.b64encode(annotated_bytes).decode("utf-8")
-        result["vlm"] = _call_vlm(annotated_bytes)
+        result["vlm"] = _call_vlm(annotated_bytes, vlm_candidates)
     else:
         result["annotated_image_b64"] = None
         result["vlm"] = None
