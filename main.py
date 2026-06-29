@@ -58,8 +58,8 @@ CLASS_NAMES = {
 RISK_CLASSES = {"fire", "smoke"}
 FALSE_POSITIVE_CLASSES = {"carlight"}
 
-VLM_CONF_LOW = 0.6
-VLM_CONF_HIGH = 0.8
+VLM_CONF_LOW = float(os.getenv("VLM_CONF_LOW", "0.6"))
+VLM_CONF_HIGH = float(os.getenv("VLM_CONF_HIGH", "0.8"))
 
 MODEL_CONFIGS = {
     "rt-detr": {
@@ -370,7 +370,7 @@ def _draw_bboxes(image_bytes: bytes, detections: list) -> bytes:
     pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     draw = ImageDraw.Draw(pil_image)
 
-    for det in detections:
+    for i, det in enumerate(detections, 1):
         bbox = det["bbox"]
         class_name = det["class_name"]
         confidence = det["confidence"]
@@ -379,7 +379,7 @@ def _draw_bboxes(image_bytes: bytes, detections: list) -> bytes:
         x1, y1, x2, y2 = bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"]
         draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
 
-        label = f"{class_name} {confidence:.2f}"
+        label = f"{i}. {class_name} {confidence:.2f}"
         draw.text((x1, max(0, y1 - 16)), label, fill=color)
 
     buf = io.BytesIO()
@@ -449,8 +449,17 @@ def _parse_vlm_response(raw: str, detections: list) -> Optional[list]:
         pattern = rf"{i}\.\s*(?:오탐\s*여부\s*[:：]\s*)?(yes|no)\s*[/／、,]\s*(.+?)(?=\n\s*\d+\.|$)"
         match = re.search(pattern, raw, re.IGNORECASE | re.DOTALL)
         if not match:
-            logger.warning(f"[VLM] {i}번 항목({det['class_name']}) 파싱 실패")
-            return None
+            # 파싱 실패 항목은 오탐아님(is_false_positive=False)으로 보수적 처리
+            # → fire/smoke는 화재 가능성 유지, carlight는 저장 생략 대상에서 제외됨
+            logger.warning(
+                f"[VLM] {i}번 항목({det['class_name']}) 파싱 실패 → 오탐아님으로 보수 처리"
+            )
+            results.append({
+                "class_name": det["class_name"],
+                "is_false_positive": False,
+                "reason": "파싱 실패",
+            })
+            continue
         is_false_positive = match.group(1).lower() == "yes"
         reason = match.group(2).strip()
         results.append({
