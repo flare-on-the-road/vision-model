@@ -481,8 +481,9 @@ def _call_vlm(image_bytes: bytes, detections: list) -> Optional[list]:
 def _parse_vlm_response(raw: str, detections: list) -> Optional[list]:
     results = []
     for i, det in enumerate(detections, 1):
-        # "1. 오탐 여부: yes / 근거" 또는 "1. yes / 근거" 형태 모두 허용
-        pattern = rf"{i}\.\s*(?:오탐\s*여부\s*[:：]\s*)?(yes|no)\s*[/／、,]\s*(.+?)(?=\n\s*\d+\.|$)"
+        # "1. 오탐 여부: no(정상) / 근거", "1. no / 근거", "1. 오탐 여부: yes / 근거" 등 허용.
+        # yes/no 뒤 괄호 주석(정상)/(오탐)은 프롬프트가 요구하는 형식이므로 선택적으로 흡수한다.
+        pattern = rf"{i}\.\s*(?:오탐\s*여부\s*[:：]\s*)?(yes|no)\s*(?:\([^)]*\))?\s*[/／、,]\s*(.+?)(?=\n\s*\d+\.|$)"
         match = re.search(pattern, raw, re.IGNORECASE | re.DOTALL)
         if not match:
             # 파싱 실패 = VLM 판단 불명. 화재확정(오탐)으로 단정하지 않고 '미확정'으로 못박는다.
