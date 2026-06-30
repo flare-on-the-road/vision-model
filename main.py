@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import base64
 import logging
 import os
@@ -58,8 +58,10 @@ CLASS_NAMES = {
 RISK_CLASSES = {"fire", "smoke"}
 FALSE_POSITIVE_CLASSES = {"carlight"}
 
-VLM_CONF_LOW = float(os.getenv("VLM_CONF_LOW", "0.6"))
-VLM_CONF_HIGH = float(os.getenv("VLM_CONF_HIGH", "0.8"))
+VLM_CONF_LOW = float(os.getenv("VLM_CONF_LOW", "0.3"))
+VLM_CONF_HIGH = float(os.getenv("VLM_CONF_HIGH", "0.7"))
+# 이 이상이면 carlight 동시검출이어도 VLM 없이 즉시확정 (초고신뢰 화재는 지연 없이 알림)
+VLM_CONF_OVERRIDE = float(os.getenv("VLM_CONF_OVERRIDE", "0.9"))
 
 MODEL_CONFIGS = {
     "rt-detr": {
@@ -387,6 +389,40 @@ def _draw_bboxes(image_bytes: bytes, detections: list) -> bytes:
     return buf.getvalue()
 
 
+def _gate_detections(detections: list) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    데이터 기반 게이팅 규칙 적용 (신뢰도 0.30 미만 무시).
+
+    반환: (immediate, vlm_targets)
+      - immediate   : VLM 없이 즉시 화재 확정할 fire/smoke (≥0.70, carlight 동시검출 아님)
+      - vlm_targets : VLM 2차 판단이 필요한 fire/smoke
+
+    규칙 (우선순위 순):
+      - fire/smoke ≥ 0.90           → 즉시 확정 (carlight 동시검출이어도 우선, 지연 없이 알림)
+      - carlight + fire/smoke 동시   → 해당 fire/smoke를 VLM 게이트 강제 (0.90 미만일 때)
+      - fire/smoke ≥ 0.70           → 즉시 확정
+      - fire/smoke 0.30~0.70        → VLM 게이트
+      - carlight 단독 / 나머지        → 무시 (어느 목록에도 포함 안 됨)
+    """
+    dets = [d for d in detections if d["confidence"] >= VLM_CONF_LOW]
+    carlight_present = any(d["class_name"] in FALSE_POSITIVE_CLASSES for d in dets)
+
+    immediate: list = []
+    vlm_targets: list = []
+    for d in dets:
+        if d["class_name"] not in RISK_CLASSES:
+            continue  # carlight 등은 자체 알림/VLM 대상 아님
+        if d["confidence"] >= VLM_CONF_OVERRIDE:
+            immediate.append(d)                # ≥0.90 초고신뢰 → carlight 있어도 즉시확정 우선
+        elif carlight_present:
+            vlm_targets.append(d)              # 동시검출 → VLM 강제 (단, OVERRIDE 미만일 때만)
+        elif d["confidence"] >= VLM_CONF_HIGH:
+            immediate.append(d)                # ≥0.70 즉시 확정
+        else:
+            vlm_targets.append(d)              # 0.30~0.70 VLM 게이트
+    return immediate, vlm_targets
+
+
 def _call_vlm(image_bytes: bytes, detections: list) -> Optional[list]:
     """
     OpenRouter VLM 호출. 탐지 항목별 오탐 여부를 반환한다.
@@ -449,15 +485,17 @@ def _parse_vlm_response(raw: str, detections: list) -> Optional[list]:
         pattern = rf"{i}\.\s*(?:오탐\s*여부\s*[:：]\s*)?(yes|no)\s*[/／、,]\s*(.+?)(?=\n\s*\d+\.|$)"
         match = re.search(pattern, raw, re.IGNORECASE | re.DOTALL)
         if not match:
-            # 파싱 실패 항목은 오탐아님(is_false_positive=False)으로 보수적 처리
-            # → fire/smoke는 화재 가능성 유지, carlight는 저장 생략 대상에서 제외됨
+            # 파싱 실패 = VLM 판단 불명. 화재확정(오탐)으로 단정하지 않고 '미확정'으로 못박는다.
+            # → is_false_positive=True로 두어 자동 화재 알림은 막고(오탐 위험 차단),
+            #   undetermined 플래그로 사람이 확인하도록 표시한다.
             logger.warning(
-                f"[VLM] {i}번 항목({det['class_name']}) 파싱 실패 → 오탐아님으로 보수 처리"
+                f"[VLM] {i}번 항목({det['class_name']}) 파싱 실패 → 미확정 처리 (사람 확인 필요)"
             )
             results.append({
                 "class_name": det["class_name"],
-                "is_false_positive": False,
-                "reason": "파싱 실패",
+                "is_false_positive": True,
+                "undetermined": True,
+                "reason": "VLM 응답 파싱 실패 — 사람 확인 필요",
             })
             continue
         is_false_positive = match.group(1).lower() == "yes"
@@ -524,18 +562,29 @@ async def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # 신뢰도 구간(0.6~0.8) 탐지 시 bbox 이미지 생성 → VLM 2차 판단 (항목별 오탐 여부)
-    vlm_candidates = [
-        d for d in result["detections"]
-        if VLM_CONF_LOW <= d["confidence"] <= VLM_CONF_HIGH
-    ]
-    if vlm_candidates:
-        annotated_bytes = _draw_bboxes(image_bytes, vlm_candidates)
+    # 게이팅: 즉시 확정(VLM 생략) / VLM 게이트 분리
+    immediate, vlm_targets = _gate_detections(result["detections"])
+    vlm_results: list = []
+
+    # VLM 대상(0.30~0.70 또는 carlight 동시검출)은 bbox 이미지로 2차 판단
+    if vlm_targets:
+        annotated_bytes = _draw_bboxes(image_bytes, vlm_targets)
         result["annotated_image_b64"] = base64.b64encode(annotated_bytes).decode("utf-8")
-        result["vlm"] = _call_vlm(annotated_bytes, vlm_candidates)
+        judged = _call_vlm(annotated_bytes, vlm_targets)
+        if judged:
+            vlm_results.extend(judged)
     else:
         result["annotated_image_b64"] = None
-        result["vlm"] = None
+
+    # 즉시 확정(fire/smoke ≥0.70)은 VLM 없이 화재 확정으로 합성 기록
+    for d in immediate:
+        vlm_results.append({
+            "class_name": d["class_name"],
+            "is_false_positive": False,
+            "reason": "고신뢰도 즉시 확정",
+        })
+
+    result["vlm"] = vlm_results or None
 
     return result
 
